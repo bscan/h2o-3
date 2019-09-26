@@ -13,12 +13,15 @@ import water.*;
 import water.H2O.H2OCountedCompleter;
 import water.fvec.C0DChunk;
 import water.fvec.Chunk;
+import water.fvec.Frame;
 import water.util.ArrayUtils;
 import water.util.FrameUtils;
 import water.util.MathUtils;
 import water.util.MathUtils.BasicStats;
 
 import java.util.Arrays;
+
+import static hex.glm.GLMTask.CalculateAugXZ.getCorrectChunk;
 
 /**
  * All GLM related distributed tasks:
@@ -32,6 +35,8 @@ import java.util.Arrays;
  */
 public abstract class GLMTask  {
   final static double EPS=1e-10;
+  final static double ZEROEQUAL = 1e-8;
+  final static double ONEEQUAL = 1-1e-8;
   static class NullDevTask extends MRTask<NullDevTask> {
     double _nullDev;
     final double [] _ymu;
@@ -1648,6 +1653,615 @@ public abstract class GLMTask  {
   }
 */
 
+  /***
+   * This class will fill in the part 0 | Wpsi*In part of AugXZ.
+   * It will also calculated wpsi, zmi for frame _prior_weights_psi
+   */
+  public static class CalculateAugXZRand extends MRTask<CalculateAugXZRand> {
+    GLMParameters _parms;
+    public int[] _random_columnsID;
+    public int[] _randCatLevels;  // categorical levels for random columns
+    public int[] _cumRandCatLevels; // cumulative sum of random column categorical levels
+    public int _randColNumber;
+    public int _randNumColStart;
+    public long _totRowNumber;
+    public long _randRowStart;  // index into absolute row number start in Frame _AugXZ
+    public double[] _psi;
+    public double[] _phi;
+    public double _tau;
+    public int _numRandCol; // number of random columns specified by user
+    Job _job;
+    Frame _prior_weights_psi; // first column is prior weight, second column is wpsi, third is zmi
+    double[] _vi; // coefficients
+    public int _totAugxzColNumber;
+
+    public CalculateAugXZRand(Job job, GLMParameters params, int augxzColNumber, long augxzRowNumber, 
+                              int[] randCatLevels, double[] psi, double[] phi, Frame prior_weights_psi, double tau,
+                              double[] vi) {
+      _job = job;
+      _parms = params;
+      _prior_weights_psi = prior_weights_psi;
+      _numRandCol = _parms._random_columns.length;  // number of random columns specified by user
+      _random_columnsID = _parms._random_columns;
+      _randCatLevels = randCatLevels;  // store levels of all random columns
+      _cumRandCatLevels = ArrayUtils.cumsum(randCatLevels);
+      _randColNumber = ArrayUtils.sum(_randCatLevels);  // total number of random columns after expansion
+      _randNumColStart = augxzColNumber - _randColNumber;
+      _randRowStart = augxzRowNumber-_randColNumber;  // row where random columns are attached to AugXZ
+      _totRowNumber = augxzRowNumber;
+      _totAugxzColNumber = augxzColNumber;
+      _psi = psi;
+      _phi = phi;
+      _tau = tau;
+      _vi = vi;
+    }
+
+    public static int findRandColIndex(int[] cumrandCatLevels, long rowIndex) {
+      int len = cumrandCatLevels.length;
+      for (int index = 0; index < len; index++) {
+        if (rowIndex < cumrandCatLevels[index])
+          return index;
+      }
+      return (len-1);
+    }
+    
+    @Override
+    public void map(Chunk[] chunks) {       // chunks will be AugXZ
+      long chkStartIdx = chunks[0].start(); // absolute row number of AugXZ chunk
+      if ((chkStartIdx+chunks[0].len()) >= _randRowStart) { // only start working if we are looking at correct chunk
+        GLMWeightsFun[] glmfunRand = ReturnGLMMMERunInfo.getRandGLMFuns(null, _numRandCol, _parms);
+        // need to figure out which chunk of priorWeightsWpsi to take and where the row start should be as well
+        Chunk[] priorWeightsWpsi = new Chunk[3];
+        int chkRowStart = (int) (_randRowStart-chkStartIdx); // relative start in AugXZ
+        int chkWeightRowStart = chkRowStart > 0?0:-chkRowStart;
+        chkRowStart  = chkRowStart  > 0?chkRowStart:0;  // whole chunk of AugXZ used to calculate lower part of AugXZ
+
+        int[] weightChunkInfo = getCorrectChunk(_prior_weights_psi, 0, chkWeightRowStart, priorWeightsWpsi, 
+                null, null);  // start from 0 to total randColExpanded
+        int psiColumnIndex = (int)priorWeightsWpsi[0].start()+_randNumColStart;// number of rows in current weight chunk
+        for (int index = chkRowStart; index < chunks[0]._len; index++) {  // go throw each row of AugXZ
+          int randIndex = findRandColIndex(_cumRandCatLevels, index+psiColumnIndex);
+          double wpsi = getRandWeights(glmfunRand[randIndex], _psi[weightChunkInfo[2]], _phi[weightChunkInfo[2]], 
+                  priorWeightsWpsi[0].atd(weightChunkInfo[2]), _vi[weightChunkInfo[2]], weightChunkInfo[2], priorWeightsWpsi[2]);
+          priorWeightsWpsi[1].set(weightChunkInfo[2], wpsi);  // update weight frame with new weight
+          for (int colIndex=0; colIndex < psiColumnIndex; colIndex++) {
+            chunks[colIndex].set(index, 0.0); // zero out columns to left of psiColumnIndex
+          }
+          chunks[psiColumnIndex++].set(index, wpsi);        // update weight to AugXZ
+          for (int colIndex=psiColumnIndex; colIndex < _totAugxzColNumber; colIndex++)
+            chunks[colIndex].set(index, 0.0); // zero out columns to right of psiColumnIndex
+          weightChunkInfo[2]++;
+          if (weightChunkInfo[2] > weightChunkInfo[1]) {  // need to grab a new weight chunk
+            weightChunkInfo = getCorrectChunk(_prior_weights_psi, weightChunkInfo[0]+1,
+                    weightChunkInfo[2]+chunks[0].start(), priorWeightsWpsi, null, weightChunkInfo);
+          }
+        }
+      }
+    }
+
+    public static double getRandWeights(GLMWeightsFun glmfun, double psi, double phi, double prior_weight, 
+                                        double vi, int rowInd, Chunk priorWeightsWpsi) {
+      double temp = glmfun.linkInvDeriv(phi); // du_dv
+      double ui = glmfun.linkInv(vi);
+      double zmi = vi+(psi-ui)/temp;
+      priorWeightsWpsi.set(rowInd, zmi);
+      double wpsi = prior_weight * temp * temp / (glmfun.variance(psi) * phi);
+      return Math.sqrt(wpsi);
+    }
+  }
+  
+  public static class GenerateResid extends MRTask<GenerateResid> {
+    public Job _job;
+    double _oneOverSqrtSumDevONMP;
+    int _hvColIdx;
+    int _residColIdx;
+    long _numDataRows;
+    
+    public GenerateResid(Job job, double oneOverSqrtSumDevONMP, int hvColIdx, int residColIdx, long numDataRows) {
+      _job = job;
+      _oneOverSqrtSumDevONMP = oneOverSqrtSumDevONMP;
+      _hvColIdx = hvColIdx;
+      _residColIdx = residColIdx;
+      _numDataRows = numDataRows;
+    }
+
+    @Override
+    public void map(Chunk[] chunks) { // chunk contains infos from GLMMME run
+      long chkStartRowIdx = chunks[0].start();
+      int chkRowNumber = chunks[0].len();
+      for (int rowIndex=0; rowIndex<chkRowNumber; rowIndex++) {
+        long absRowIdx = rowIndex+chkStartRowIdx;
+        if (absRowIdx < _numDataRows) { // only need to generate resid for data rows
+          double tempVal = chunks[_residColIdx].atd(rowIndex)*_oneOverSqrtSumDevONMP;
+          chunks[_residColIdx].set(rowIndex, tempVal/Math.sqrt(1-chunks[_hvColIdx].atd(rowIndex)));
+        } else
+          break;
+      }
+    }
+  }
+  
+  public static class ExtractFrameFromSource extends MRTask<ExtractFrameFromSource> {
+    public Frame _sourceFrame;
+    int[] _devhvColIdx;
+    long _startRowIndex;  // matches 0 row of dest chunk
+    long _lengthToCopy;
+    
+    public ExtractFrameFromSource(Frame sourceFrame, int[] devHvColIdx, long startRowIndex, long lengthCopy) {
+      _sourceFrame = sourceFrame;
+      _devhvColIdx = devHvColIdx;
+      _startRowIndex = startRowIndex;
+      _lengthToCopy = lengthCopy;
+    }
+
+    @Override
+    public void map(Chunk[] chunks) {
+      long startChkIdx = chunks[0].start(); // absolute row index of chunks to copy to.
+      int chkLen = chunks[0].len();
+      long sourceChkIdx = _startRowIndex+startChkIdx; // absolute source chunk row index
+      Chunk[] sourceChunks = new Chunk[_devhvColIdx.length];
+      int[] fetchedChunkInfo = getCorrectChunk(_sourceFrame, 0, sourceChkIdx, sourceChunks, _devhvColIdx, 
+              null);
+      for (int rowIndex=0; rowIndex < chkLen; rowIndex++) {
+        int fetchedRelRowIndex = rowIndex+fetchedChunkInfo[2];
+        if (fetchedRelRowIndex > fetchedChunkInfo[1]) {
+          fetchedChunkInfo = getCorrectChunk(_sourceFrame, fetchedChunkInfo[0]+1, 
+                  fetchedRelRowIndex+fetchedChunkInfo[1], sourceChunks, _devhvColIdx, fetchedChunkInfo);
+          fetchedRelRowIndex = rowIndex+fetchedChunkInfo[2];
+        }
+        double temp = 1.0-sourceChunks[1].atd(fetchedRelRowIndex);
+        chunks[0].set(rowIndex, sourceChunks[0].atd(fetchedRelRowIndex)/temp);  // set response
+        chunks[2].set(rowIndex, temp/2);  // set weight
+      }
+    }
+  }
+
+  /***
+   * This class will copy columns from a source frame to columns in the destination frame
+   * 
+   */
+  public static class CopyPartsOfFrame extends MRTask<CopyPartsOfFrame> {
+    public Frame _sourceFrame;
+    public int[] _destColIndices;
+    public int[] _sourceColIndices;
+    public long _nrowsToCopy;
+
+    public CopyPartsOfFrame(Frame fr, int[] destFrameColID, int[] sourceFrameColID, long numRows) {
+      _sourceFrame = fr;
+      if (destFrameColID == null) {
+        int numCols = fr.numCols();
+        _destColIndices = new int[numCols];
+        _sourceColIndices = new int[numCols];
+        for (int colIndex = 0; colIndex < numCols; colIndex++) {
+          _destColIndices[colIndex] = colIndex;
+          _sourceColIndices[colIndex] = colIndex;
+        }
+      } else {
+        _destColIndices = destFrameColID;
+        _sourceColIndices = sourceFrameColID;
+      }
+      _nrowsToCopy = numRows;
+    }
+
+    @Override
+    public void map(Chunk[] chunks) { // chunk contains infos from GLMMME run
+      int colLen = _destColIndices.length;
+      long chkStartIdx = chunks[0].start(); // first row of destination frame
+      Chunk[] sourceChunks = new Chunk[colLen]; // just fetch the needed columns
+      long lastRowIndex = chkStartIdx + chunks[0].len();
+      if (chkStartIdx < _nrowsToCopy) { // only copy chunk when there are enough source chunks
+        int rowLen = lastRowIndex > _nrowsToCopy ? ((int) (_nrowsToCopy - chkStartIdx)) : chunks[0].len();
+        int[] fetchedChkInfo = getCorrectChunk(_sourceFrame, 0, chkStartIdx, sourceChunks, _sourceColIndices, null);
+        for (int rowIndex = 0; rowIndex < rowLen; rowIndex++) {
+          int fetchedChkRelRow = rowIndex + fetchedChkInfo[2];
+          if (fetchedChkRelRow > fetchedChkInfo[1]) {  // need new chunk
+            fetchedChkInfo = getCorrectChunk(_sourceFrame, fetchedChkInfo[0] + 1,
+                    rowIndex + chkStartIdx, sourceChunks, _sourceColIndices, fetchedChkInfo);
+            fetchedChkRelRow = rowIndex + fetchedChkInfo[2];
+          }
+          for (int colIndex = 0; colIndex < colLen; colIndex++) {
+            chunks[_destColIndices[colIndex]].set(rowIndex, sourceChunks[colIndex].atd(fetchedChkRelRow));
+          }
+        }
+      }
+    }
+  }
+  
+  public static class ReturnGLMMMERunInfo extends MRTask<ReturnGLMMMERunInfo> {
+    public DataInfo _dinfo;
+    public Frame _w_prior_wpsi;
+    public Frame _augXZ;
+    Job _job;
+    double _sumDev;
+    double _sumEtaDiffSq;
+    double _sumEtaSq;
+    public int _totalaugXZCol;
+    public int[] _dinfoWCol;  // columns to load from dinfo to calculate z and dev
+    public int[] _wpriorwpsiCol;  // columns to load from _w_prior_wpsi to calculate z and dev
+    public long _numDataRow; 
+    public int _maxdinfoCol;  // number of columns to load from dinfo._adaptedFrame
+    GLMParameters _parms;
+    public double[] _psi;
+    public double[] _ubeta;
+    public int[] _cumRandCatLevels; // cumulative sum of random column categorical levels
+    public int _numRandCol;
+
+    public ReturnGLMMMERunInfo(Job job, DataInfo datainfo, Frame wpriorwpsi, Frame augxz, int[] dinfoWCol, int[] wCol,
+                               GLMParameters params, double[] psi, double[] ubeta, int[] cumRandCatLevels) {
+      _job = job;
+      _dinfo = datainfo;
+      _w_prior_wpsi = wpriorwpsi;
+      _augXZ = augxz;
+      _sumDev = 0;
+      _sumEtaDiffSq = 0;
+      _sumEtaSq = 0;
+      _totalaugXZCol = augxz.numCols();
+      _dinfoWCol = dinfoWCol;
+      _wpriorwpsiCol = wCol;
+      _numDataRow = _dinfo._adaptedFrame.numRows();
+      _maxdinfoCol = _dinfo._weights?4:3;
+      _parms = params;
+      _psi = psi;
+      _ubeta = ubeta;
+      _cumRandCatLevels = cumRandCatLevels;
+      _numRandCol = cumRandCatLevels.length;
+    }
+
+    public static GLMWeightsFun[] getRandGLMFuns(GLMWeightsFun[] randGLMs, int numRandFuncs, GLMParameters params) {
+      if (randGLMs == null)
+        randGLMs = new GLMWeightsFun[numRandFuncs];
+      for (int index=0; index < numRandFuncs; index++) {
+        randGLMs[index] = new GLMWeightsFun(params._rand_family[index], params._rand_link[index],
+                params._tweedie_variance_power, params._tweedie_link_power, 0);
+      }
+      return randGLMs;
+    }
+
+    @Override
+    public void reduce(ReturnGLMMMERunInfo other){
+      this._sumEtaDiffSq += other._sumEtaDiffSq;
+      this._sumEtaSq += other._sumEtaSq;
+    }
+    
+    @Override
+    public void map(Chunk[] chunks) { // chunk contains infos from GLMMME run
+      GLMWeightsFun glmfun=null;
+      GLMWeightsFun[] glmfunRand = null;
+      long chkStartRowIdx = chunks[0].start(); // first row number of chunk
+      int chkRowNumber = chunks[0].len();
+      Chunk[] chunksAugXZ = new Chunk[_totalaugXZCol]; // fetch chunk from AugXZ in order to calculate hv, Augz
+      int[] augxzInfo = getCorrectChunk(_augXZ, 0, chkStartRowIdx, chunksAugXZ, null, null);
+      Chunk[] chunks4ZDev = new Chunk[4]; // potentially load response, zi, etai, weightID
+      int[] zdevChunkInfo = new int[3];
+      boolean usingWpsi;
+      long rowOffset = chkStartRowIdx-_numDataRow;
+      if (chkStartRowIdx >= _numDataRow) {  // load _w_prior_wpsi chunks, get wprior, zmi
+        usingWpsi = true;
+        zdevChunkInfo = getCorrectChunk(_w_prior_wpsi, 0, rowOffset, chunks4ZDev,
+                _wpriorwpsiCol, zdevChunkInfo);
+        glmfunRand = getRandGLMFuns(glmfunRand, _numRandCol, _parms);
+      } else {  // load from dinfo: response, zi, etai and maybe weightID for prior_weight
+        usingWpsi = false;
+        glmfun = new GLMWeightsFun(_parms._family, _parms._link, _parms._tweedie_variance_power,
+                _parms._tweedie_link_power, 0);
+        zdevChunkInfo = getCorrectChunk(_dinfo._adaptedFrame, 0, chkStartRowIdx, chunks4ZDev, _dinfoWCol,
+                zdevChunkInfo);
+      }
+      for (int rowIndex=0; rowIndex < chkRowNumber; rowIndex++) { // correct chunks are loaded for now
+        int zdevAbsRelRowNumber = usingWpsi?(int)(rowIndex+rowOffset):rowIndex+zdevChunkInfo[2];  // offset into zdevChunks
+        if (!usingWpsi && (zdevAbsRelRowNumber >= zdevChunkInfo[1])) {  // running out of rows with dinfo
+          long rowAbsIndex = rowIndex+chkStartRowIdx;
+          if (rowAbsIndex>=_numDataRow) { // load from wprior_wpsi
+            usingWpsi=true;
+            zdevChunkInfo = getCorrectChunk(_w_prior_wpsi, 0, rowAbsIndex-_numDataRow,
+                    chunks4ZDev, _wpriorwpsiCol, zdevChunkInfo);
+            if (glmfunRand==null) { // generate glmfunRand[] for the first time only
+              glmfunRand = getRandGLMFuns(glmfunRand, _numRandCol, _parms);
+            }
+          } else {  // still load from dinfo
+            zdevChunkInfo = getCorrectChunk(_dinfo._adaptedFrame, 0,
+                    rowAbsIndex, chunks4ZDev, _dinfoWCol, zdevChunkInfo);
+            if (glmfun==null)
+              glmfun = new GLMWeightsFun(_parms._family, _parms._link, _parms._tweedie_variance_power,
+                      _parms._tweedie_link_power, 0);
+          }
+          zdevAbsRelRowNumber = usingWpsi?(int)(rowIndex+rowOffset):rowIndex+zdevChunkInfo[2];
+        }  else if (usingWpsi && (zdevAbsRelRowNumber-zdevChunkInfo[0]) >= zdevChunkInfo[1]) {  // load from wprior_wpsi
+          zdevChunkInfo = getCorrectChunk(_w_prior_wpsi, 0, zdevAbsRelRowNumber, chunks4ZDev, _wpriorwpsiCol, 
+                  zdevChunkInfo);
+          if (glmfunRand==null) { // generate glmfunRand[] for the first time only
+            glmfunRand = getRandGLMFuns(glmfunRand, _numRandCol, _parms);
+          }
+          zdevAbsRelRowNumber = (int)(rowIndex+rowOffset);
+        }
+        _sumDev += calDev(usingWpsi, _cumRandCatLevels, zdevAbsRelRowNumber, chunks4ZDev, chunks, rowIndex, glmfun, glmfunRand, _psi, _ubeta);
+        setHv(chunksAugXZ, chunks[1], rowIndex, augxzInfo[2]++);  // get hv from augXZ only
+        if (augxzInfo[2] > augxzInfo[1]) {  // need to load in new chunk
+          augxzInfo = getCorrectChunk(_augXZ, 1+augxzInfo[0], chkStartRowIdx, chunksAugXZ, null, augxzInfo);
+        }
+      }
+    }
+    
+    public static void setHv(Chunk[] qmat, Chunk hv, int relRowIndex, int qmatRelRowIndex) {
+      int numCol = qmat.length;
+      double rowSum = 0;
+      for (int colIndex=0; colIndex < numCol; colIndex++) {
+        double temp = qmat[colIndex].atd(qmatRelRowIndex);
+        rowSum += temp*temp;
+      }
+      hv.set(relRowIndex, rowSum > ONEEQUAL?ONEEQUAL:rowSum);
+    }
+
+    public  double calDev(boolean usingWpsi, int[] _cumRandCatLevels, int zdevAbsRelRowNumber, Chunk[] chunks4ZDev,
+                                Chunk[] chunks, int rowIndex, GLMWeightsFun glmfun,
+                                GLMWeightsFun[] glmfunRand, double[] psi, double[] ubeta) {
+      if (usingWpsi) {
+        int randIndex = CalculateAugXZRand.findRandColIndex(_cumRandCatLevels, zdevAbsRelRowNumber);
+        return setZDevEta(chunks4ZDev, chunks, rowIndex, (int) (zdevAbsRelRowNumber-chunks[0].start()), 
+                (int) zdevAbsRelRowNumber, glmfunRand[randIndex], psi, ubeta);
+      } else {          // get z, dev, eta from dinfo
+        return setZDevEta(chunks4ZDev, chunks, rowIndex, zdevAbsRelRowNumber, glmfun);
+      }
+    }
+    
+    public static double setZDevEta(Chunk[] wpsiChunks, Chunk[] destChunk, int relRowIndex, int wpsiRowIndex, 
+                                    int abswpsiRowIndex, GLMWeightsFun glmfuns, double[] psi, double[] ubeta) {
+      destChunk[0].set(relRowIndex, wpsiChunks[1].atd(wpsiRowIndex)); // set Z value
+      double temp = psi[abswpsiRowIndex]-ubeta[abswpsiRowIndex];
+      double devVal=wpsiChunks[0].atd(wpsiRowIndex)*temp*temp;
+      destChunk[2].set(relRowIndex, devVal < ZEROEQUAL?ZEROEQUAL:devVal);
+      return devVal;
+    }
+    
+    public  double setZDevEta(Chunk[] dinfoChunks, Chunk[] destChunk, int relRowIndex, int dinfoRowIndex, 
+                                    GLMWeightsFun glmfun) {
+      destChunk[0].set(relRowIndex, dinfoChunks[1].atd(dinfoRowIndex)); // set AugZ value
+      double eta = dinfoChunks[2].atd(dinfoRowIndex);
+      destChunk[3].set(relRowIndex, eta); // set new eta value
+      double temp2 = eta-destChunk[5].atd(relRowIndex);
+      _sumEtaDiffSq += temp2*temp2;
+      _sumEtaSq += eta*eta;
+      double temp = dinfoChunks[0].atd(dinfoRowIndex)-glmfun.linkInv(eta);
+      destChunk[4].set(relRowIndex, temp);  // set resid = (y-mu.i)
+      double prior_weight = dinfoChunks[3]==null?1:dinfoChunks[3].atd(dinfoRowIndex);
+      double devVal = prior_weight*temp*temp;
+      destChunk[2].set(relRowIndex, devVal < ZEROEQUAL?ZEROEQUAL:devVal);
+      return devVal;
+    }
+  }
+
+  // generate AugZ*W as a double array 
+  public static class CalculateAugZW extends MRTask<CalculateAugZW> {
+    GLMParameters _parms;
+    public DataInfo _dinfo; // contains X and Z in response
+    public int[] _random_columnsID;
+    public int _augZID;
+    public int _dataColNumber;
+    public int _randColNumber;
+    public int _numColStart;
+    public int _numRandCol;
+    public long _numDataRows;
+    Job _job;
+    Frame _prior_weight_psi;  // contains prior_weight, wpsi, zmi
+    public int[] _dinfoWCol;
+    public int[] _weightWCol;
+
+    public  CalculateAugZW(Job job, DataInfo dInfo, GLMParameters params, Frame prior_weight_psi, int randCatLevels,
+                           int dinfoRespColStart, int weightColStart) { // pass it norm mul and norm sup - in the weights already done. norm
+      _job = job;
+      _dinfo = dInfo;
+      _parms = params;
+      _prior_weight_psi = prior_weight_psi;
+      _augZID = _dinfo.responseChunkId(2);  // 0: response, 1: wdata, 2: zi
+      _dataColNumber = _dinfo.fullN()+1; // add 1 for intercept at the beginning
+      _numColStart = _dinfo.numCats()==0?0:_dinfo._catOffsets[_dinfo.numCats()];
+      _numRandCol = _parms._random_columns.length;
+      _random_columnsID = new int[_numRandCol];
+      System.arraycopy(_parms._random_columns, 0, _random_columnsID, 0, _numRandCol);
+      _randColNumber = randCatLevels; // total number of random columns expanded
+      _numDataRows = _dinfo._adaptedFrame.numRows();  // number of data rows
+      _dinfoWCol = new int[]{dinfoRespColStart, dinfoRespColStart+1};
+      _weightWCol = new int[]{weightColStart, weightColStart+1};
+    }
+
+    @Override
+    public void map(Chunk[] chunks) { // chunks from AugZ
+      long chkStartIdx = chunks[0].start();           // first row number of chunks
+      int chunkLen = chunks[0]._len;
+      Chunk[] augzwChunks = new Chunk[2]; // loaded from _dinfo or _prior_weight_psi
+      int[] extraChkInfo = new int[3];
+      boolean use_wprior_wpsi = false;
+      if (chkStartIdx < _numDataRows) { // grab wdata and zi from _dinfo._adaptedFrame.
+        extraChkInfo = getCorrectChunk(_dinfo._adaptedFrame, 0, chkStartIdx, augzwChunks,
+                _dinfoWCol, extraChkInfo);
+      } else {
+        use_wprior_wpsi=true;
+        extraChkInfo = getCorrectChunk(_prior_weight_psi, 0, chkStartIdx, augzwChunks,
+                _weightWCol, extraChkInfo);
+      }
+      for (int rowIndex=0; rowIndex < chunkLen; rowIndex++) {
+        int extraRelRow = use_wprior_wpsi?extraChkInfo[2]++:rowIndex+extraChkInfo[2];
+        chunks[0].set(rowIndex, augzwChunks[0].atd(extraRelRow)*augzwChunks[1].atd(extraRelRow));
+        if (extraRelRow >= extraChkInfo[1]) { // need to load new chunk
+          long chkAbsRowNumber = rowIndex+chkStartIdx;
+          if (chkAbsRowNumber < _numDataRows) { // need to load from dinfo
+            extraChkInfo = getCorrectChunk(_dinfo._adaptedFrame, 0, chkAbsRowNumber, augzwChunks,
+                    _dinfoWCol, extraChkInfo);
+            use_wprior_wpsi=false;
+          } else { // need to load from w_prior_psi
+            extraChkInfo = getCorrectChunk(_prior_weight_psi, 0, chkAbsRowNumber-_numDataRows, 
+                    augzwChunks, _weightWCol, extraChkInfo);
+            use_wprior_wpsi=true;
+          }
+        }
+      }
+    }
+  }
+  
+  // generate AugXZ, AugZ.  It will save the generated wand and zi inside the response of _dinfo._adaptedFrame
+    public static class CalculateAugXZ extends MRTask<CalculateAugXZ> {
+    GLMParameters _parms;
+    public DataInfo _dinfo; // contains X and Z in response
+    public int _prior_weightID;
+    public int _wdataID;
+    public int _offsetID;
+    public int[] _random_columnsID;
+    public int[] _randCatLevels;  // categorical levels for random columns
+    public int _augZID;
+    public int _etaOldID;
+    public int _dataColNumber;
+    public int _randColNumber;
+    public int _numColStart;
+    public double[] _beta;
+    public double[] _ubeta;
+    public double[] _psi;
+    public double[] _phi;
+    public double _tau;
+    public int _numRandCol;
+    Job _job;
+    Frame _AugXZ;
+    public double _sumEtaDiffSq;
+    public double _sumEtaSq;
+    public double _HL_correction;
+
+    public  CalculateAugXZ(Job job, DataInfo dInfo, GLMParameters params, Frame augxz, int[] randCatLevels, 
+                           double[] beta, double[] ubeta, double[] psi, double[] phi, double tau, double hlCorrection) { // pass it norm mul and norm sup - in the weights already done. norm
+      _job = job;
+      _dinfo = dInfo;
+      _parms = params;
+      _prior_weightID = _dinfo._weights?_dinfo.weightChunkId():-1;
+      _augZID = _dinfo.responseChunkId(2);  // 0: response, 1: wdata, 2: zi, 3: etaOld
+      _wdataID = _dinfo.responseChunkId(1);
+      _etaOldID = _dinfo.responseChunkId(3);
+      _offsetID = _dinfo._offset?_dinfo.offsetChunkId():-1;
+      _AugXZ = augxz; // _AugXZ and _AugZ will have the same number of rows.
+      _dataColNumber = _dinfo.fullN()+1; // add 1 for intercept at the beginning
+      _numColStart = _dinfo.numCats()==0?0:_dinfo._catOffsets[_dinfo.numCats()];
+      _numRandCol = _parms._random_columns.length;
+      _randColNumber = augxz.numCols()-_dataColNumber-1;
+      _random_columnsID = _parms._random_columns;
+      _randCatLevels = randCatLevels;
+      _beta = beta;
+      _ubeta = ubeta;
+      _psi = psi;
+      _phi = phi;
+      _tau = tau;
+      _HL_correction=hlCorrection;
+      _sumEtaDiffSq=0;
+      _sumEtaSq=0;
+    }
+
+    @Override
+    public void map(Chunk[] chunks) {
+      GLMWeightsFun glmfun = new GLMWeightsFun(_parms._family, _parms._link, _parms._tweedie_variance_power,
+              _parms._tweedie_link_power, 0);
+      long chkStartIdx = chunks[0].start(); // first row number of chunks
+      int numColAugXZ = _AugXZ.numCols(); // size of the augxz frame 1+datacols+randomCols
+      Chunk[] augXZChunks = new Chunk[numColAugXZ];      // grab the correct chunk from AugXZ
+      int[] augxzChunkInfo = getCorrectChunk(_AugXZ, 0, chkStartIdx, augXZChunks, null, null);
+      double[] processedRow = new double[numColAugXZ]; // store wdata*(intercept and x), wdata*z
+      Row row = _dinfo.newDenseRow();
+      for (int i = 0; i < chunks[0]._len; ++i) { // going over all the rows in the chunk
+        _dinfo.extractDenseRow(chunks, i, row);
+        if (!row.isBad() && row.weight != 0) {
+          int augXZRelRow = i+augxzChunkInfo[2];
+          if (augXZRelRow >= augxzChunkInfo[1]) {  // need to grab a new chunk for augXZ
+            augxzChunkInfo = getCorrectChunk(_AugXZ, 1+augxzChunkInfo[0], i+chkStartIdx, 
+                    augXZChunks, null, augxzChunkInfo);
+            augXZRelRow = i+augxzChunkInfo[2];
+          }
+          Arrays.fill(processedRow, 0.0);
+          double wdata = getWeights(glmfun, _beta, _ubeta, _tau, row, chunks, i);  // calculate weight wdata for data columns, set zi in response
+          chunks[_wdataID].set(i, wdata); // set the new weight back to frame.
+          row.scalarProduct(wdata, processedRow, _numColStart); // generate w*X
+          int offset = _dataColNumber;
+          for (int randColIndex = 0; randColIndex < _numRandCol; randColIndex++) { // generate x*Z
+            int processRowIdx = offset + (int) row.response[4 + randColIndex];  // 0: response, 1: weight, 2: zi, 3: etai, 4 or more: z
+            processedRow[processRowIdx] = wdata;  // save wdata as
+            offset += _randCatLevels[randColIndex]; // write to next random column value
+          }
+          for (int colIndex = 0; colIndex < numColAugXZ; colIndex++) {      // assign the rows to the AugXZ
+            augXZChunks[colIndex].set(augXZRelRow, processedRow[colIndex]); // set w*X with intercept, data
+          }
+        }
+      }
+    }
+
+    @Override
+    public void reduce(CalculateAugXZ other){
+      this._sumEtaDiffSq += other._sumEtaDiffSq;
+      this._sumEtaSq += other._sumEtaSq;
+    }
+
+    public double getWeights(GLMWeightsFun glmfun, double[] beta, double[] ubeta, double tau, Row row, Chunk[] augzChunk,
+                             int rowIndex) {
+      double eta = row.innerProduct(beta) + row.offset;
+      for (int index=0; index < _numRandCol; index++) {
+        eta += ubeta[(int)row.response(4+index)];
+      }
+      if (Double.isNaN(eta))
+        throw H2O.fail("GLM.MME diverged! Try different starting values.");
+      double etaDiff = eta - row.response(3);
+      augzChunk[_etaOldID].set(rowIndex, eta);  // save current eta
+      _sumEtaDiffSq += etaDiff * etaDiff;
+      _sumEtaSq += eta * eta;
+      double mu = glmfun.linkInv(eta);
+      double temp = glmfun.linkInvDeriv(mu);
+      double zi = eta - row.offset + (row.response(0) - mu) / temp - _HL_correction;
+      augzChunk[_augZID].set(rowIndex, zi);
+      double wdata = row.weight * temp * temp / (glmfun.variance(mu) * tau);
+      return Math.sqrt(wdata);
+    }
+    
+    public static int[] getCorrectChunk(Frame augXZ, int chkIdx, long currentRowAbs, Chunk[] chks, int[] vecIdx, 
+                                        int[] returnInfo) {
+      int currentIdx = chkIdx;
+      while (currentIdx >= 0) { // currentIdx will be -1 if found the correct chunk
+        currentIdx = getOneSingleChunk(augXZ, currentIdx, currentRowAbs, chks, vecIdx);
+      }
+      getAllChunks(augXZ, chks[0].cidx(),chks, vecIdx);
+      if (returnInfo == null) {
+        returnInfo = new int[3];
+      }
+      returnInfo[0] = chks[0].cidx(); // chunk index of fetched chunks
+      returnInfo[1] = chks[0].len();  // number of rows in fetched chunks
+      returnInfo[2] = (int) (currentRowAbs-chks[0].start());  // relative row start of fetched chunk
+      return returnInfo;
+    }
+    
+    public static void getAllChunks(Frame augXZ, int chkIdx, Chunk[] chks, int[] vecIdx) {
+      if (vecIdx==null) { // copy all vectors of the chunk
+        int chkLen = chks.length;
+        // fetch one vector and check if it contains the correct rows
+        for (int chkIndex =1 ; chkIndex < chkLen; chkIndex++)
+          chks[chkIndex] = augXZ.vec(chkIndex).chunkForChunkIdx(chkIdx);
+      } else {
+        int veclen = vecIdx.length;
+        for (int index=1; index < veclen; index++)
+          chks[index] = augXZ.vec(vecIdx[index]).chunkForChunkIdx(chkIdx);
+      }
+    }
+    
+    public static int getOneSingleChunk(Frame augXZ, int chkIdx, long currentRowAbs, Chunk[] chks, int[] vecIdx) {
+      if (vecIdx==null) { // copy all vectors of the chunk
+        // fetch one vector and check if it contains the correct rows
+        chks[0] = augXZ.vec(0).chunkForChunkIdx(chkIdx);
+      } else {
+        int veclen = vecIdx.length;
+        chks[0] = augXZ.vec(vecIdx[0]).chunkForChunkIdx(chkIdx);
+      }
+      
+      // find correct row offset into chunk.
+      long strow = chks[0].start();
+      long endrow = chks[0].len()+strow;
+      if ((currentRowAbs >= strow) && (currentRowAbs< endrow))
+        return -1;
+      else if (currentRowAbs < strow)
+        return (chkIdx-1);
+      else
+        return (chkIdx+1);
+    }
+  }
+  
   public static class GLMCoordinateDescentTaskSeqNaive extends MRTask<GLMCoordinateDescentTaskSeqNaive> {
     public double [] _normMulold;
     public double [] _normSubold;
