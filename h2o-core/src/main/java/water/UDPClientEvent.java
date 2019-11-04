@@ -28,7 +28,7 @@ public class UDPClientEvent extends UDP {
         // Connect event is not sent in multicast mode
         case CONNECT:
           if (H2O.isFlatfileEnabled()) {
-            H2ONode client = H2ONode.intern(ce.clientIp, ce.clientPort, ce.clientTimestamp);
+            H2ONode client = H2ONode.intern(ce.clientIp, ce.clientPort);
             Log.info("Client " + client + " reported via broadcast message from " + ab._h2o);
             H2O.addNodeToFlatfile(client);
           }
@@ -38,7 +38,7 @@ public class UDPClientEvent extends UDP {
         case DISCONNECT:
           // handle regular disconnection
           if (H2O.isFlatfileEnabled()) {
-            H2ONode client = H2ONode.intern(ce.clientIp, ce.clientPort, ce.clientTimestamp);
+            H2ONode client = H2ONode.intern(ce.clientIp, ce.clientPort);
 
             Log.info("Client " + client + " has been disconnected on " + ab._h2o);
             H2O.removeNodeFromFlatfile(client);
@@ -78,7 +78,6 @@ public class UDPClientEvent extends UDP {
     public Type type;
     InetAddress clientIp;
     int clientPort;
-    short clientTimestamp;
     HeartBeat senderHeartBeat;
     HeartBeat clientHeartBeat;
 
@@ -90,7 +89,6 @@ public class UDPClientEvent extends UDP {
       this.senderHeartBeat = senderHeartBeat;
       this.clientIp = clientNode._key.getAddress();
       this.clientPort = clientNode._key.htm_port();
-      this.clientTimestamp = clientNode.getTimestamp();
       this.clientHeartBeat = clientNode._heartbeat;
     }
 
