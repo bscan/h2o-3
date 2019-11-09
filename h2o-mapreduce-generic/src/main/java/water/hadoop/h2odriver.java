@@ -1659,6 +1659,7 @@ public class h2odriver extends Configured implements Tool {
     if (client) {
       addMapperArg(conf, "-md5skip");
       addMapperArg(conf, "-disable_web");
+      addMapperArg(conf, "-allow_clients");
     }
 
     // Proxy
