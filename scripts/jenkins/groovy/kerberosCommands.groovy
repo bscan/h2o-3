@@ -18,17 +18,16 @@ def call(final stageConfig) {
 }
 
 private GString getCommandHadoop(final stageConfig, final spnegoAuth) {
-    def loginArgs = ""
-    def loginEnvs = ""
+    def loginArgs
+    def loginEnvs
     if (spnegoAuth) {
         loginArgs = """-spnego_login -user_name ${stageConfig.customData.kerberosUserName} \\
                 -login_conf ${stageConfig.customData.spnegoConfigPath} \\
                 -spnego_properties ${stageConfig.customData.spnegoPropertiesPath}"""
         loginEnvs = """export KERB_PRINCIPAL=${stageConfig.customData.kerberosPrincipal}"""
     } else {
-        loginArgs = """-kerberos_login -user_name ${stageConfig.customData.kerberosUserName} \\
-                -login_conf ${stageConfig.customData.kerberosConfigPath}"""
-        loginEnvs = """export KERB_PRINCIPAL=${stageConfig.customData.kerberosPrincipal}"""
+        loginArgs = """-kerberos_login -login_conf ${stageConfig.customData.kerberosConfigPath}"""
+        loginEnvs = ""
     }
     return """
             rm -fv h2o_one_node h2odriver.out
