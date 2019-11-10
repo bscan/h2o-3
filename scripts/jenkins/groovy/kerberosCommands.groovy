@@ -22,8 +22,12 @@ private GString getCommandHadoop(final stageConfig, final spnegoAuth) {
     def loginEnvs = ""
     if (spnegoAuth) {
         loginArgs = """-spnego_login -user_name ${stageConfig.customData.kerberosUserName} \\
-                -login_conf ${stageConfig.customData.kerberosConfigPath} \\
-                -spnego_properties ${stageConfig.customData.kerberosPropertiesPath}"""
+                -login_conf ${stageConfig.customData.spnegoConfigPath} \\
+                -spnego_properties ${stageConfig.customData.spnegoPropertiesPath}"""
+        loginEnvs = """export KERB_PRINCIPAL=${stageConfig.customData.kerberosPrincipal}"""
+    } else {
+        loginArgs = """-kerberos_login -user_name ${stageConfig.customData.kerberosUserName} \\
+                -login_conf ${stageConfig.customData.kerberosConfigPath}"""
         loginEnvs = """export KERB_PRINCIPAL=${stageConfig.customData.kerberosPrincipal}"""
     }
     return """
@@ -66,8 +70,8 @@ private GString getCommandStandalone(final stageConfig) {
                 -port ${defaultPort} -ip \$(hostname --ip-address) -name \$(date +%s) \\
                 -jks mykeystore.jks \\
                 -spnego_login -user_name ${stageConfig.customData.kerberosUserName} \\
-                -login_conf ${stageConfig.customData.kerberosConfigPath} \\
-                -spnego_properties ${stageConfig.customData.kerberosPropertiesPath} \\
+                -login_conf ${stageConfig.customData.spnegoConfigPath} \\
+                -spnego_properties ${stageConfig.customData.spnegoPropertiesPath} \\
                 > standalone_h2o.log 2>&1 & sleep 15
             export KERB_PRINCIPAL=${stageConfig.customData.kerberosPrincipal}
             export CLOUD_IP=\$(hostname --ip-address)
