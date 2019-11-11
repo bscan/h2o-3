@@ -397,11 +397,14 @@ def call(final pipelineContext) {
       throw new IllegalArgumentException("Distribution ${distribution} is no longer supported. Update pipeline config.")
     }
     def target
+    def ldapConfigPath
     if ((distribution.name == 'cdh' && distribution.version.startsWith('6.')) ||
             (distribution.name == 'hdp' && distribution.version.startsWith('3.'))){
       target = 'test-kerberos-hadoop-3'
+      ldapConfigPath = 'scripts/jenkins/config/ldap-jetty-9.txt'
     } else {
       target = 'test-kerberos-hadoop-2'
+      ldapConfigPath = 'scripts/jenkins/config/ldap-jetty-8.txt'
     }
 
     def stageTemplate = [
@@ -415,6 +418,7 @@ def call(final pipelineContext) {
                     distribution: distribution.name,
                     version: distribution.version,
                     commandFactory: 'h2o-3/scripts/jenkins/groovy/kerberosCommands.groovy',
+                    ldapConfigPath: ldapConfigPath,
                     kerberosUserName: 'jenkins@H2O.AI',
                     kerberosPrincipal: 'HTTP/localhost@H2O.AI',
                     kerberosConfigPath: 'scripts/jenkins/config/kerberos.conf',
