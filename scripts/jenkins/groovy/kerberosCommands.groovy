@@ -26,7 +26,7 @@ private GString getCommandHadoop(final stageConfig, final spnegoAuth) {
                 -spnego_properties ${stageConfig.customData.spnegoPropertiesPath}"""
         loginEnvs = """export KERB_PRINCIPAL=${stageConfig.customData.kerberosPrincipal}"""
     } else {
-        loginArgs = """-ldap_login -login_conf ${stageConfig.customData.ldapConfigPath}"""
+        loginArgs = "-ldap_login -login_conf ${stageConfig.customData.ldapConfigPath}"
         loginEnvs = ""
     }
     return """
