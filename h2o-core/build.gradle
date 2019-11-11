@@ -19,6 +19,7 @@ dependencies {
   testCompileOnly "javax.servlet:servlet-api:2.5"
   compile ("com.github.wendykierp:JTransforms:3.1") { exclude module: "junit" }
   compile project(":h2o-jaas-pam")
+  compile project(":h2o-security")
 
   compile("log4j:log4j:1.2.17") {
     exclude module: "activation" 
